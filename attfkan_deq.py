@@ -1,276 +1,330 @@
+"""
+attfkan_deq.py
+--------------
+AttFKAN-DEQ: Attention-Enhanced Fourier Kolmogorov-Arnold Networks
+             using Deep Equilibrium for Breast Cancer Histopathology Classification.
+
+Pipeline
+--------
+1.  CNN backbone  →  spatial features  [B, C_bb, H', W']
+2.  Global average pool + linear projection  →  fixed injection vector p  [B, h]
+3.  DEQ fixed-point iteration  →  equilibrium state z*  [B, h]
+        z^{k+1} = (1-α)z^k + α · (p + f_AttFKAN(z^k + p))
+4.  Linear classifier  →  logits  [B, num_classes]
+
+The AttFKAN block (f_AttFKAN) is a residual structure:
+        f_AttFKAN(u) = u + LCBAM( FKAN2( ReLU( FKAN1( LN(u) ) ) ) )
+with u = z + p.
+
+References
+----------
+- Bai et al., "Deep Equilibrium Models", NeurIPS 2019.
+- Xu et al., "FourierKAN-GCF", arXiv:2406.01034, 2024.
+- Woo et al., "CBAM", ECCV 2018.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .fourier_kan import NaiveFourierKANLayer
-from .lcbam import LCBAM  # Use your full LCBAM
 
-class AttFKANBlock(nn.Module):
-    def __init__(self, dim, grid_size=8):
+from fourier_kan import NaiveFourierKANLayer
+from lcbam import LCBAM
+
+
+# ── Lightweight CNN Backbone ─────────────────────────────────────────────────
+
+class BasicBlock(nn.Module):
+    """Simple residual block used in the custom CNN backbone."""
+
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1):
         super().__init__()
-        self.norm1 = nn.LayerNorm(dim)
-        self.fkan1 = NaiveFourierKANLayer(dim, dim, grid_size)
-        self.norm2 = nn.LayerNorm(dim)
-        self.fkan2 = NaiveFourierKANLayer(dim, dim, grid_size)
-        self.lcbam = LCBAM(dim)  # Your full attention
-
-    def forward(self, x):
-        residual = x
-        out = self.fkan1(self.norm1(x))
-        out = F.relu(out)
-        out = self.fkan2(self.norm2(out))
-        # Reshape for LCBAM (assuming vectorized features)
-        B, L, C = out.shape
-        out = out.view(B, C, 1, L)
-        out = self.lcbam(out)
-        out = out.view(B, L, C)
-        return residual + out
-
-class AttFKAN_DEQ(nn.Module):
-    def __init__(self, in_channels=3, hidden_dim=512, num_classes=2, grid_size=8, max_iters=10, alpha=0.5):
-        super().__init__()
-        self.cnn_backbone = nn.Sequential(  # Replace with ResNet if desired
-            nn.Conv2d(in_channels, 64, 7, stride=2, padding=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(3, stride=2, padding=1),
-            # Add more layers as needed
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, stride=stride, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1, bias=False),
+            nn.BatchNorm2d(out_ch),
         )
-        self.proj = nn.Linear(64, hidden_dim)  # Adjust based on backbone output
-        self.block = AttFKANBlock(hidden_dim, grid_size)
-        self.max_iters = max_iters
-        self.alpha = alpha
-        self.classifier = nn.Linear(hidden_dim, num_classes)
+        self.skip = nn.Sequential()
+        if stride != 1 or in_ch != out_ch:
+            self.skip = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch),
+            )
 
-    def forward(self, x):
-        B = x.shape[0]
-        features = self.cnn_backbone(x)
-        p = F.adaptive_avg_pool2d(features, 1).view(B, -1)
-        p = self.proj(p).unsqueeze(1)  # [B, 1, hidden_dim]
-        z = torch.zeros_like(p, device=x.device)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.relu(self.conv(x) + self.skip(x), inplace=True)
 
-        for _ in range(self.max_iters):
-            z_prev = z
-            z = z_prev + p + self.block(z_prev + p)
-            z = (1 - self.alpha) * z_prev + self.alpha * z
 
-        logits = self.classifier(z.squeeze(1))
-        return logits
+def build_backbone(in_channels: int, base_ch: int = 32) -> tuple:
+    """
+    Build the lightweight custom CNN backbone described in Figure 2 of the paper.
 
-# model/attfkan_deq.py
-# Final Integrated AttFKAN-DEQ Model
-# Combines:
-# 1. Fourier-based KAN (FKAN) for expressive univariate transformations
-# 2. Lightweight Convolutional Block Attention (LCBAM) for dynamic feature recalibration
-# 3. Deep Equilibrium (DEQ) framework for memory-efficient infinite-depth refinement
+    Architecture (matching paper diagram):
+        Conv2d(in→base_ch, k=7, s=2) + BN + ReLU  →  [B, base_ch, H/2, W/2]
+        BasicBlock(stride=1)                        →  [B, base_ch, H/2, W/2]
+        BasicBlock(stride=2)                        →  [B, 2*base_ch, H/4, W/4]
+        BasicBlock(stride=2)                        →  [B, 4*base_ch, H/8, W/8]
+        BasicBlock(stride=2)                        →  [B, 4*base_ch, H/16, W/16]
+        AdaptiveAvgPool2d(1)  →  Flatten            →  [B, 4*base_ch]
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from .fourier_kan import NaiveFourierKANLayer
-from .lcbam import LCBAM
+    Returns:
+        (backbone_module, out_channels)
+    """
+    out_ch = base_ch * 4
+    backbone = nn.Sequential(
+        nn.Conv2d(in_channels, base_ch, kernel_size=7, stride=2, padding=3, bias=False),
+        nn.BatchNorm2d(base_ch),
+        nn.ReLU(inplace=True),
+        BasicBlock(base_ch, base_ch, stride=1),
+        BasicBlock(base_ch, base_ch * 2, stride=2),
+        BasicBlock(base_ch * 2, out_ch, stride=2),
+        BasicBlock(out_ch, out_ch, stride=2),
+    )
+    return backbone, out_ch
+
+
+# ── AttFKAN Block ─────────────────────────────────────────────────────────────
 
 class AttFKANBlock(nn.Module):
     """
-    Attention-Augmented Fourier KAN Residual Block.
-    
-    This is the core nonlinear transformation f_AttFKAN(z + p) used in the DEQ fixed-point equation.
-    
-    Architecture:
-    - LayerNorm → FKAN1 → ReLU → LayerNorm → FKAN2 → Reshape to [B, C, 1, 1] → LCBAM → Reshape back → Residual
-    
-    The block enables:
-    - Expressive multi-scale modeling via Fourier series
-    - Dynamic channel and spatial focus via lightweight attention
-    - Stable gradient flow via residual connection and normalization
+    Attention-Augmented Fourier KAN Residual Block  (f_AttFKAN).
+
+    This is the core nonlinear transformation used inside the DEQ loop.
+
+    Given u = z + p  ∈  ℝ^{B×1×h}, the block computes:
+        out = u + LCBAM( FKAN2( ReLU( FKAN1( LayerNorm(u) ) ) ) )
+
+    The LCBAM is applied by temporarily reshaping the sequence to a
+    [B, C, 1, L] pseudo-image so the 2-D attention module is compatible.
+
+    Args:
+        dim (int): Hidden dimension h.
+        grid_size (int): Fourier frequency terms per edge. Default: 8.
+        reduction_ratio (int): LCBAM channel reduction ratio. Default: 16.
+        dropout (float): Dropout probability applied after each FKAN. Default: 0.2.
     """
-    def __init__(self, dim: int, grid_size: int = 8, reduction_ratio: int = 16):
+
+    def __init__(
+        self,
+        dim: int,
+        grid_size: int = 8,
+        reduction_ratio: int = 16,
+        dropout: float = 0.2,
+    ):
         super(AttFKANBlock, self).__init__()
-        
-        # Pre-FKAN normalization
+
         self.norm1 = nn.LayerNorm(dim)
         self.fkan1 = NaiveFourierKANLayer(
             inputdim=dim,
             outdim=dim,
             gridsize=grid_size,
             addbias=True,
-            smooth_initialization=True
+            smooth_initialization=True,
         )
-        
+        self.drop1 = nn.Dropout(p=dropout)
+
         self.norm2 = nn.LayerNorm(dim)
         self.fkan2 = NaiveFourierKANLayer(
             inputdim=dim,
             outdim=dim,
             gridsize=grid_size,
             addbias=True,
-            smooth_initialization=True
+            smooth_initialization=True,
         )
-        
-        # Lightweight attention module
+        self.drop2 = nn.Dropout(p=dropout)
+
+        # LCBAM expects [B, C, H, W]; we reshape [B, L, C] → [B, C, 1, L]
         self.lcbam = LCBAM(channels=dim, reduction_ratio=reduction_ratio)
 
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Hidden state tensor [B, 1, hidden_dim] (seq_len=1 in DEQ context)
-        
+            x: [B, L, dim]  (L = 1 in the DEQ context)
+
         Returns:
-            Refined tensor with residual connection [B, 1, hidden_dim]
+            Refined tensor [B, L, dim] with residual connection.
         """
         residual = x
-        
-        # First FKAN transformation
+
+        # First FKAN pass
         out = self.norm1(x)
         out = self.fkan1(out)
-        out = F.relu(out)
-        
-        # Second FKAN transformation
+        out = self.drop1(F.relu(out, inplace=False))
+
+        # Second FKAN pass
         out = self.norm2(out)
         out = self.fkan2(out)
-        
-        # Apply LCBAM: treat vector as 1x1 "image"
-        B, L, C = out.shape
-        out = out.view(B, C, 1, L)  # [B, C, 1, seq_len]
-        out = self.lcbam(out)
-        out = out.view(B, L, C)     # Back to [B, seq_len, C]
-        
-        # Residual connection
-        out = residual + out
-        
-        return out
+        out = self.drop2(out)
 
+        # LCBAM: reshape [B, L, C] → [B, C, 1, L] → [B, L, C]
+        B, L, C = out.shape
+        out = out.permute(0, 2, 1).unsqueeze(2)   # [B, C, 1, L]
+        out = self.lcbam(out)                      # [B, C, 1, L]
+        out = out.squeeze(2).permute(0, 2, 1)      # [B, L, C]
+
+        return residual + out
+
+
+# ── Full AttFKAN-DEQ Model ────────────────────────────────────────────────────
 
 class AttFKAN_DEQ(nn.Module):
     """
-    Complete AttFKAN-DEQ Model.
-    
-    Full pipeline:
-    1. CNN backbone extracts spatial features from histopathological image
-    2. Global average pooling + linear projection creates fixed injection vector p ∈ ℝ^hidden_dim
-    3. DEQ solves the fixed-point equation:
-          z* = z* + p + f_AttFKAN(z* + p)
-       using relaxed fixed-point iteration with parameter α
-    4. Equilibrium state z* is passed to classifier for benign/malignant prediction
-    
-    This design enables infinite-depth refinement with constant memory usage.
+    AttFKAN-DEQ: Full model for histopathological breast cancer classification.
+
+    Args:
+        in_channels (int): Input image channels (3 for RGB). Default: 3.
+        hidden_dim (int): DEQ hidden state dimension h. Default: 128.
+        num_classes (int): Number of output classes (2 for benign/malignant). Default: 2.
+        grid_size (int): Fourier grid size g. Default: 8.
+        max_iters (int): Maximum DEQ fixed-point iterations. Default: 10.
+        tol (float): Convergence tolerance for early stopping. Default: 1e-4.
+        alpha (float): DEQ relaxation coefficient α ∈ (0, 1]. Default: 0.5.
+        backbone (str): CNN backbone choice: 'custom' | 'resnet18' | 'resnet50'.
+                        Default: 'custom'.
+        base_ch (int): Base channel count for the custom backbone. Default: 32.
+        dropout (float): Dropout inside AttFKAN block. Default: 0.2.
+        reduction_ratio (int): LCBAM reduction ratio. Default: 16.
     """
-    def __init__(self,
-                 in_channels: int = 3,
-                 hidden_dim: int = 512,
-                 num_classes: int = 2,
-                 grid_size: int = 8,
-                 max_iters: int = 10,
-                 tol: float = 1e-4,
-                 alpha: float = 0.5,
-                 backbone: str = 'resnet50'):
+
+    def __init__(
+        self,
+        in_channels: int = 3,
+        hidden_dim: int = 128,
+        num_classes: int = 2,
+        grid_size: int = 8,
+        max_iters: int = 10,
+        tol: float = 1e-4,
+        alpha: float = 0.5,
+        backbone: str = "custom",
+        base_ch: int = 32,
+        dropout: float = 0.2,
+        reduction_ratio: int = 16,
+    ):
         super(AttFKAN_DEQ, self).__init__()
-        
+
         self.hidden_dim = hidden_dim
         self.max_iters = max_iters
         self.tol = tol
         self.alpha = alpha
-        
-        # CNN backbone for initial feature extraction
-        if backbone == 'resnet50':
+
+        # ── CNN Backbone ──────────────────────────────────────────────────
+        if backbone == "resnet50":
             import torchvision.models as models
-            resnet = models.resnet50(pretrained=True)
-            self.cnn_backbone = nn.Sequential(*list(resnet.children())[:-2])  # Remove avgpool and fc
+            _resnet = models.resnet50(weights="IMAGENET1K_V1")
+            self.cnn_backbone = nn.Sequential(*list(_resnet.children())[:-2])
             backbone_channels = 2048
-        elif backbone == 'resnet18':
+        elif backbone == "resnet18":
             import torchvision.models as models
-            resnet = models.resnet18(pretrained=True)
-            self.cnn_backbone = nn.Sequential(*list(resnet.children())[:-2])
+            _resnet = models.resnet18(weights="IMAGENET1K_V1")
+            self.cnn_backbone = nn.Sequential(*list(_resnet.children())[:-2])
             backbone_channels = 512
         else:
-            # Custom lightweight backbone
-            self.cnn_backbone = nn.Sequential(
-                nn.Conv2d(in_channels, 64, kernel_size=7, stride=2, padding=3, bias=False),
-                nn.BatchNorm2d(64),
-                nn.ReLU(inplace=True),
-                nn.MaxPool2d(kernel_size=3, stride=2, padding=1),
-                nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(128),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(256, hidden_dim, kernel_size=3, stride=2, padding=1, bias=False),
-                nn.BatchNorm2d(hidden_dim),
-                nn.ReLU(inplace=True)
-            )
-            backbone_channels = hidden_dim
-        
-        # Projection from backbone features to hidden dimension
+            # Custom lightweight backbone (paper Figure 2)
+            self.cnn_backbone, backbone_channels = build_backbone(in_channels, base_ch)
+
+        # ── Projection: backbone features → hidden dim ────────────────────
         self.proj = nn.Linear(backbone_channels, hidden_dim)
-        
-        # Core AttFKAN residual block for DEQ
+
+        # ── AttFKAN block (shared across all DEQ iterations) ──────────────
         self.attfkan_block = AttFKANBlock(
             dim=hidden_dim,
             grid_size=grid_size,
-            reduction_ratio=16
+            reduction_ratio=reduction_ratio,
+            dropout=dropout,
         )
-        
-        # Final classifier
+
+        # ── Classifier ────────────────────────────────────────────────────
         self.classifier = nn.Linear(hidden_dim, num_classes)
-        
-        # Weight initialization
-        self.apply(self._init_weights)
 
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+        # Weight initialisation
+        self._init_weights()
 
-    def forward(self, x):
+    # ── Initialisation ────────────────────────────────────────────────────────
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, std=0.02)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.LayerNorm)):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    # ── Forward ───────────────────────────────────────────────────────────────
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass of AttFKAN-DEQ.
-        
         Args:
-            x: Input histopathological image [B, 3, H, W]
-        
+            x: Input image [B, C, H, W].
+
         Returns:
-            logits: Classification logits [B, num_classes]
+            logits: Classification logits [B, num_classes].
         """
         B = x.shape[0]
-        
+
         # 1. CNN feature extraction
-        features = self.cnn_backbone(x)  # [B, C_backbone, H', W']
-        
-        # 2. Create fixed injection vector p
-        p = F.adaptive_avg_pool2d(features, 1)  # [B, C_backbone, 1, 1]
-        p = p.view(B, -1)                        # [B, C_backbone]
-        p = self.proj(p)                         # [B, hidden_dim]
-        p = p.unsqueeze(1)                       # [B, 1, hidden_dim] — injected every iteration
-        
-        # 3. Initialize hidden state z^(0) = 0
-        z = torch.zeros_like(p, device=x.device)
-        
-        # 4. DEQ: Solve z* = z* + p + f_AttFKAN(z* + p) using relaxed iteration
+        features = self.cnn_backbone(x)                        # [B, C_bb, H', W']
+
+        # 2. Build fixed injection vector p
+        p = F.adaptive_avg_pool2d(features, 1).view(B, -1)    # [B, C_bb]
+        p = self.proj(p).unsqueeze(1)                          # [B, 1, hidden_dim]
+
+        # 3. DEQ: relaxed fixed-point iteration
+        #    z^{k+1} = (1-α)z^k + α·(p + f_AttFKAN(z^k + p))
+        z = torch.zeros_like(p)                                 # z^{(0)} = 0
+
         for _ in range(self.max_iters):
             z_prev = z
-            
-            # Compute f_AttFKAN(z + p)
-            z_input = z_prev + p
-            z_update = self.attfkan_block(z_input)
-            
-            # Update: z + p + f_AttFKAN(z + p)
-            z_new = z_prev + p + z_update
-            
-            # Relaxation: smooth update for better convergence
-            z = (1 - self.alpha) * z_prev + self.alpha * z_new
-            
-            # Early stopping based on relative change
-            if torch.norm(z - z_prev) < self.tol * (torch.norm(z_prev) + 1e-8):
+
+            z_input = z_prev + p                               # [B, 1, hidden_dim]
+            z_update = self.attfkan_block(z_input)             # [B, 1, hidden_dim]
+            z_new = z_prev + p + z_update                      # F_θ(x, z^k)
+
+            z = (1.0 - self.alpha) * z_prev + self.alpha * z_new
+
+            # Early stopping
+            delta = torch.norm(z - z_prev)
+            scale = torch.norm(z_prev) + 1e-8
+            if delta < self.tol * scale:
                 break
-        
-        # 5. Classification from equilibrium state z*
-        logits = self.classifier(z.squeeze(1))  # [B, num_classes]
-        
+
+        # 4. Classify from equilibrium state z*
+        logits = self.classifier(z.squeeze(1))                 # [B, num_classes]
         return logits
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+
+    def count_parameters(self) -> int:
+        return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+
+# ── Quick Sanity Check ────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Device: {device}\n")
+
+    model = AttFKAN_DEQ(
+        in_channels=3,
+        hidden_dim=128,
+        num_classes=2,
+        grid_size=8,
+        max_iters=10,
+        alpha=0.5,
+        backbone="custom",
+    ).to(device)
+
+    dummy = torch.randn(4, 3, 50, 50, device=device)
+    logits = model(dummy)
+
+    print(f"Input  shape : {dummy.shape}")
+    print(f"Output shape : {logits.shape}")
+    print(f"Parameters   : {model.count_parameters():,}")
+    assert logits.shape == (4, 2), "Unexpected output shape"
+    print("✓ Forward pass OK")
