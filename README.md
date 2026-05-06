@@ -6,7 +6,9 @@
 > *IEEE Access* (under review)
 
 ---
+## Architecture Diagram
 
+![AttFKAN-DEQ Architecture](Graphical abstract.png)
 ## Overview
 
 AttFKAN-DEQ is a hybrid deep-learning framework for binary benign-vs-malignant classification of breast histopathological images. It fuses three complementary ideas into a single, memory-efficient pipeline:
