@@ -2,8 +2,9 @@
 
 **Attention-Enhanced Fourier Kolmogorov–Arnold Networks Using Deep Equilibrium for Breast Cancer Histopathology Classification**
 
-> Hassan Ali · Muhammad Asghar Khan · Gordana Barb  
-> *IEEE Access* (under review)
+> Hassan Ali · Muhammad Asghar Khan · Gordana Barb
+> Published in *IEEE Access* (2026)
+> DOI: [10.1109/ACCESS.2026.3577827](https://doi.org/10.1109/ACCESS.2026.3577827)
 
 ---
 ## 🧠 Architecture Diagram
