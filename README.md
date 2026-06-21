@@ -91,7 +91,7 @@ If you use this code or build upon our work, please cite:
   author  = {Ali, Hassan and Khan, Muhammad Asghar and Barb, Gordana},
   journal = {IEEE Access},
   year    = {2025},
-  note    = {Under review}
+  note    = {https://doi.org/10.1109/ACCESS.2026.3577827}
 }
 ```
 
